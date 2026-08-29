@@ -1,0 +1,43 @@
+{
+  "expo": {
+    "name": "Cenciss Rider",
+    "slug": "cenciss-rider",
+    "version": "1.0.1",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "scheme": "cencissrider",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.cenciss.rider"
+    },
+    "android": {
+      "package": "com.cenciss.rider",
+      "versionCode": 5,
+      "edgeToEdgeEnabled": true
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true,
+          "locationWhenInUsePermission": "Allow Cenciss Rider to record your delivery route while you are on duty.",
+          "locationAlwaysAndWhenInUsePermission": "Allow Cenciss Rider to record your delivery route while you are on duty."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#4f46e5"
+        }
+      ],
+      [
+        "expo-secure-store",
+        {
+          "configureAndroidBackup": true
+        }
+      ]
+    ]
+  }
+}
