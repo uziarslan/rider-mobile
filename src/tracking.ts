@@ -26,6 +26,7 @@ const REQUEST_TIMEOUT_MS = 15_000;
 const WATCHDOG_INTERVAL_MINUTES = 15;
 const WATCHDOG_LOCATION_TIMEOUT_MS = 20_000;
 const REPAIR_NOTIFICATION_INTERVAL_MS = 30 * 60_000;
+const REPAIR_NOTIFICATION_FAILURE_COUNT = 3;
 
 export type TrackingMode = 'stopped' | 'foreground' | 'background';
 export type TrackingPermissionResult = {
@@ -265,30 +266,38 @@ export const flushLocationQueue = () => withQueueLock(async () => {
           deviceId: await getDeviceId(),
           trackingEnabled: health.mode !== 'stopped',
           backgroundLocationGranted: health.backgroundLocationGranted,
+          batteryOptimizationEnabled: health.batteryOptimizationEnabled,
+          lowPowerMode: health.lowPowerMode,
           trackingHealth: {
             mode: health.mode,
             queueDepth: queue.length,
             taskCallbackAt: health.lastTaskCallbackAt,
+            watchdogAt: health.lastWatchdogAt,
             lastError: health.lastError || '',
+            consecutiveUploadFailures: health.consecutiveUploadFailures || 0,
           },
         }),
       }, session);
       response = request.response;
       session = request.session;
     } catch (error) {
+      const failures = Number(health.consecutiveUploadFailures || 0) + 1;
       await updateTrackingHealth({
         lastError: trackingErrorText(error),
-        consecutiveUploadFailures: Number(health.consecutiveUploadFailures || 0) + 1,
+        consecutiveUploadFailures: failures,
       });
+      if (failures >= REPAIR_NOTIFICATION_FAILURE_COUNT) await showTrackingRepairNotification();
       break;
     }
     const body = await parseResponse(response);
     if (!response.ok) {
       await stopForServerState(response.status, body);
+      const failures = Number(health.consecutiveUploadFailures || 0) + 1;
       await updateTrackingHealth({
         lastError: String(body?.message || `Location upload failed (${response.status}).`).slice(0, 500),
-        consecutiveUploadFailures: Number(health.consecutiveUploadFailures || 0) + 1,
+        consecutiveUploadFailures: failures,
       });
+      if (failures >= REPAIR_NOTIFICATION_FAILURE_COUNT) await showTrackingRepairNotification();
       break;
     }
     uploaded += batch.length;
@@ -320,7 +329,7 @@ const showAssignmentNotification = async (orderNumber: string) => {
   }
 };
 
-const showTrackingRepairNotification = async () => {
+async function showTrackingRepairNotification() {
   const now = Date.now();
   const lastShownAt = Number(await AsyncStorage.getItem(LAST_REPAIR_NOTIFICATION_KEY)) || 0;
   if (now - lastShownAt < REPAIR_NOTIFICATION_INTERVAL_MS) return;
@@ -338,7 +347,7 @@ const showTrackingRepairNotification = async () => {
   } catch {
     // The dashboard still receives the watchdog diagnostic when alerts are denied.
   }
-};
+}
 
 const checkForNewAssignment = async () => {
   const now = Date.now();
@@ -536,7 +545,7 @@ const startBackgroundTracking = async () => {
       showsBackgroundLocationIndicator: true,
       foregroundService: {
         notificationTitle: 'Cenciss Delivery · On duty',
-        notificationBody: 'Your delivery route is being recorded.',
+        notificationBody: 'Background GPS is active. Keep this app installed and do not force-stop it.',
         notificationColor: '#4f46e5',
         killServiceOnDestroy: false,
       },
@@ -576,7 +585,10 @@ export const isTracking = async (): Promise<TrackingMode> => {
   } catch {
     // Expo Go on Android does not expose background TaskManager execution.
   }
-  await AsyncStorage.setItem(TRACKING_MODE_KEY, 'stopped');
+  // Keep the requested background mode until an explicit duty-stop. Android
+  // can briefly report the native task as missing while WorkManager is waking
+  // it; replacing the stored intent with "stopped" prevents the watchdog from
+  // repairing the service later.
   await updateTrackingHealth({mode: 'stopped'});
   return 'stopped';
 };
@@ -641,6 +653,13 @@ async function runTrackingWatchdog() {
 
   const watchdogAt = new Date().toISOString();
   await updateTrackingHealth({lastWatchdogAt: watchdogAt});
+  try {
+    if (!(await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME))) {
+      await startBackgroundTracking();
+    }
+  } catch (error) {
+    await recordTrackingError(error);
+  }
   let capturedFreshLocation = false;
   try {
     const location = await withTimeout(

@@ -320,7 +320,12 @@ const RiderApp = () => {
     setPendingActions(remaining); await savePendingActions(remaining); if (remaining.length !== queued.length) refreshAll({quiet: true});
   }, [refreshAll, session]);
   useEffect(() => {
-    const unsubscribe = NetInfo.addEventListener(state => { if (state.isConnected) syncPending(); });
+    const unsubscribe = NetInfo.addEventListener(state => {
+      if (state.isConnected) {
+        syncPending();
+        flushLocationQueue().catch(() => {});
+      }
+    });
     const initialSync = setTimeout(() => { syncPending(); }, 0);
     return () => { clearTimeout(initialSync); unsubscribe(); };
   }, [syncPending]);

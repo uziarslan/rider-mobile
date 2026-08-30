@@ -51,5 +51,7 @@ test('renders the rider login screen when no secure session exists', async () =>
     renderer = ReactTestRenderer.create(<App />);
     await new Promise<void>(resolve => setImmediate(() => resolve()));
   });
-  expect(JSON.stringify(renderer!.toJSON())).toContain('Rider App');
+  const rendered = JSON.stringify(renderer!.toJSON());
+  expect(rendered).toContain('CENCISS');
+  expect(rendered).toContain('Delivery');
 });

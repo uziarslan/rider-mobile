@@ -4,6 +4,9 @@ import * as TaskManager from 'expo-task-manager';
 import {API_BASE_URL} from '../src/config';
 import {loadSession} from '../src/storage';
 import {
+  flushLocationQueue,
+  getTrackingHealth,
+  isTracking,
   queueAndSyncLocations,
   requestTrackingPermissions,
   startTracking,
@@ -23,7 +26,18 @@ jest.mock('@react-native-async-storage/async-storage', () => {
   };
 });
 
-jest.mock('expo-battery', () => ({getBatteryLevelAsync: jest.fn(async () => 0.75)}));
+jest.mock('expo-background-task', () => ({
+  BackgroundTaskStatus: {Available: 2},
+  BackgroundTaskResult: {Success: 1, Failed: 2},
+  getStatusAsync: jest.fn(async () => 2),
+  registerTaskAsync: jest.fn(async () => undefined),
+  unregisterTaskAsync: jest.fn(async () => undefined),
+}));
+jest.mock('expo-battery', () => ({
+  getBatteryLevelAsync: jest.fn(async () => 0.75),
+  isBatteryOptimizationEnabledAsync: jest.fn(async () => false),
+  isLowPowerModeEnabledAsync: jest.fn(async () => false),
+}));
 jest.mock('expo-location', () => ({
   Accuracy: {High: 4},
   getForegroundPermissionsAsync: jest.fn(async () => ({granted: true})),
@@ -48,14 +62,17 @@ jest.mock('expo-task-manager', () => ({
   isTaskDefined: jest.fn(() => false),
   defineTask: jest.fn(),
   isAvailableAsync: jest.fn(async () => false),
+  isTaskRegisteredAsync: jest.fn(async () => false),
 }));
 jest.mock('../src/storage', () => ({
+  getDeviceId: jest.fn(async () => 'rider-device-id'),
   loadSession: jest.fn(async () => ({
     accessToken: 'access-token',
     refreshToken: 'refresh-token',
     apiBaseUrl: 'https://api.example.com',
     user: {name: 'Rider', email: 'rider@example.com', role: 'rider'},
   })),
+  saveSession: jest.fn(async () => undefined),
 }));
 
 const response = (body: unknown, ok = true, status = 200) => ({
@@ -108,8 +125,25 @@ test('starts the Expo background location task in an APK build', async () => {
   await expect(startTracking()).resolves.toBe('background');
   expect(Location.startLocationUpdatesAsync).toHaveBeenCalledWith(
     'cenciss-rider-background-location',
-    expect.objectContaining({timeInterval: 10_000, foregroundService: expect.any(Object)}),
+    expect.objectContaining({
+      timeInterval: 10_000,
+      foregroundService: expect.objectContaining({
+        notificationBody: expect.stringContaining('Background GPS is active'),
+        killServiceOnDestroy: false,
+      }),
+    }),
   );
+});
+
+test('preserves background tracking intent when Android briefly reports the service missing', async () => {
+  (TaskManager.isAvailableAsync as jest.Mock).mockResolvedValue(true);
+  (Location.getBackgroundPermissionsAsync as jest.Mock).mockResolvedValue({granted: true});
+
+  await expect(startTracking()).resolves.toBe('background');
+  (Location.hasStartedLocationUpdatesAsync as jest.Mock).mockResolvedValue(false);
+
+  await expect(isTracking()).resolves.toBe('stopped');
+  await expect(AsyncStorage.getItem('@cenciss-rider/tracking-mode')).resolves.toBe('background');
 });
 
 test('uploads captured points and removes them from the offline queue', async () => {
@@ -136,7 +170,34 @@ test('uploads captured points and removes them from the offline queue', async ()
     expect.objectContaining({method: 'POST'}),
   );
   const request = (globalThis.fetch as jest.Mock).mock.calls[0][1];
-  const points = JSON.parse(request.body).points;
+  const requestBody = JSON.parse(request.body);
+  const points = requestBody.points;
   expect(points[0]).toMatchObject({latitude: 31.5204, longitude: 74.3587, batteryLevel: 75, source: 'gps'});
+  expect(requestBody.trackingHealth).toMatchObject({queueDepth: 1, consecutiveUploadFailures: 0});
   await expect(AsyncStorage.getItem('@cenciss-rider/location-queue')).resolves.toBe('[]');
+});
+
+test('retains queued GPS points and records consecutive upload failures', async () => {
+  (globalThis.fetch as jest.Mock).mockRejectedValue(new Error('network unavailable'));
+
+  await queueAndSyncLocations([{
+    coords: {
+      latitude: 31.5204,
+      longitude: 74.3587,
+      altitude: 210,
+      accuracy: 6,
+      altitudeAccuracy: 8,
+      heading: 90,
+      speed: 4,
+    },
+    timestamp: Date.now(),
+    mocked: false,
+  }]);
+  await flushLocationQueue();
+  await flushLocationQueue();
+
+  const health = await getTrackingHealth();
+  expect(health.queueDepth).toBe(1);
+  expect(health.consecutiveUploadFailures).toBe(3);
+  expect(health.lastError).toContain('network unavailable');
 });
