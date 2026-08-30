@@ -52,6 +52,7 @@ export type DeliveryItem = {
 export type DeliveryAssignment = {
   _id: string;
   active: boolean;
+  businessDate?: string | null;
   orderNumber: string;
   status: DeliveryStatus;
   customerName?: string;
@@ -87,6 +88,7 @@ export type RiderBootstrap = {
     inOutletGeofence?: boolean | null;
   };
   assignments: DeliveryAssignment[];
+  businessDate?: string;
   trackingRequired: boolean;
   serverTime: string;
 };

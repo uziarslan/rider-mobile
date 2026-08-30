@@ -1,4 +1,4 @@
-import {clearSession, saveSession} from './storage';
+import {clearSession, loadSession, saveSession} from './storage';
 import {API_BASE_URL} from './config';
 import type {AuthSession} from './types';
 
@@ -33,6 +33,15 @@ const parseResponse = async (response: Response) => {
   return body;
 };
 
+const synchronizePersistedSession = async () => {
+  const persisted = await loadSession();
+  if (!persisted) return;
+  if (!currentSession || persisted.accessToken !== currentSession.accessToken || persisted.refreshToken !== currentSession.refreshToken) {
+    currentSession = {...persisted, apiBaseUrl: API_BASE_URL};
+    sessionListener?.(currentSession);
+  }
+};
+
 export const riderLogin = async (email: string, password: string): Promise<AuthSession> => {
   let response: Response;
   try {
@@ -61,6 +70,7 @@ export const riderLogin = async (email: string, password: string): Promise<AuthS
 };
 
 const refreshSession = async (): Promise<AuthSession> => {
+  await synchronizePersistedSession();
   if (!currentSession) throw new ApiError('Your session has ended.', 401);
   if (!refreshPromise) {
     refreshPromise = (async () => {
@@ -84,6 +94,7 @@ const refreshSession = async (): Promise<AuthSession> => {
 };
 
 export const apiRequest = async <T = any>(path: string, init: RequestInit = {}, retry = true): Promise<T> => {
+  await synchronizePersistedSession();
   if (!currentSession) throw new ApiError('Please sign in again.', 401);
   let response: Response;
   try {
