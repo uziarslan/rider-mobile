@@ -65,10 +65,35 @@ export type DeliveryAssignment = {
     latitude?: number | null;
     longitude?: number | null;
   };
+  deliveryChargeAmount?: number;
   totalAmount?: number;
   notes?: string;
   items?: DeliveryItem[];
   assignedAt?: string;
+  deliveryRunId?: string;
+  pickupState?: 'queued_at_restaurant' | 'ready_for_pickup' | 'with_rider' | 'delivery_stop_completed' | 'completed';
+  queuedAtRestaurantAt?: string | null;
+  readyForPickupAt?: string | null;
+  runStartedAt?: string | null;
+  routeSequence?: number;
+  routeStartedAt?: string | null;
+  routeEndedAt?: string | null;
+  routePointCount?: number;
+  routeDistanceMeters?: number;
+  deliveryOutcome?: 'delivered' | 'delivery_failed' | '';
+  runReturnedAt?: string | null;
+  completedAt?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+};
+
+export type DeliveryRun = {
+  id: string;
+  orders: DeliveryAssignment[];
+  completedStops: number;
+  totalStops: number;
+  canReturn: boolean;
+  waitingForPickup: boolean;
 };
 
 export type RiderBootstrap = {

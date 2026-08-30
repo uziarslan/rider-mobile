@@ -1,7 +1,10 @@
 import {
   applyAssignmentSocketEvent,
+  applyAssignmentSocketEvents,
   assignmentMapsQuery,
   assignmentWhatsAppUrl,
+  deliveryRunsFromAssignments,
+  replaceAssignmentsIfChanged,
   whatsappPhoneNumber,
 } from '../src/assignments';
 import type {DeliveryAssignment} from '../src/types';
@@ -48,6 +51,41 @@ test('adds a complete new assignment received over Socket.IO', () => {
 
   expect(result).toHaveLength(1);
   expect(result[0].items?.[0].name).toBe('Fries');
+});
+
+test('patches only the changed assignment when a delivery run socket event arrives', () => {
+  const second = {...accepted, _id: 'assignment-2', orderNumber: 'ORD-1002', status: 'picked_up' as const};
+  const result = applyAssignmentSocketEvents([accepted, second], [{
+    _id: 'assignment-1',
+    status: 'delivered',
+    pickupState: 'delivery_stop_completed',
+  }]);
+  expect(result[0].status).toBe('delivered');
+  expect(result[1]).toBe(second);
+  expect(result[1].status).toBe('picked_up');
+});
+
+test('keeps the same list reference when a socket payload changes nothing', () => {
+  const rows = [accepted];
+  expect(applyAssignmentSocketEvent(rows, {_id: accepted._id, status: accepted.status})).toBe(rows);
+  expect(replaceAssignmentsIfChanged(rows, [{...accepted}])).toBe(rows);
+});
+
+test('allows one run return only after every delivery stop is complete', () => {
+  const run = deliveryRunsFromAssignments([
+    {...accepted, deliveryRunId: 'run-1', status: 'delivered', pickupState: 'delivery_stop_completed'},
+    {...accepted, _id: 'assignment-2', orderNumber: 'ORD-1002', deliveryRunId: 'run-1', status: 'picked_up', pickupState: 'with_rider'},
+  ])[0];
+  expect(run.completedStops).toBe(1);
+  expect(run.totalStops).toBe(2);
+  expect(run.canReturn).toBe(false);
+
+  const completed = deliveryRunsFromAssignments(run.orders.map(order => ({
+    ...order,
+    status: 'delivered',
+    pickupState: 'delivery_stop_completed',
+  })))[0];
+  expect(completed.canReturn).toBe(true);
 });
 
 test('uses the cashier address when stored coordinates are null', () => {

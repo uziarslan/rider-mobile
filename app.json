@@ -3,7 +3,7 @@
     "name": "Cenciss Delivery",
     "slug": "cenciss-rider",
     "description": "Secure delivery operations, live rider tracking, and order coordination for Cenciss restaurants.",
-    "version": "1.0.4",
+    "version": "1.0.5",
     "icon": "./assets/icon.png",
     "primaryColor": "#2f66e8",
     "backgroundColor": "#ffffff",
@@ -17,7 +17,8 @@
     },
     "android": {
       "package": "com.cenciss.rider",
-      "versionCode": 8,
+      "googleServicesFile": "./google-services.json",
+      "versionCode": 9,
       "edgeToEdgeEnabled": true,
       "allowBackup": false,
       "adaptiveIcon": {
@@ -44,6 +45,7 @@
       "barStyle": "dark-content"
     },
     "plugins": [
+      "./plugins/withCencissNativeTracking",
       [
         "expo-location",
         {
@@ -58,7 +60,7 @@
         {
           "icon": "./assets/notification-icon.png",
           "color": "#2f66e8",
-          "defaultChannel": "rider-assignments"
+          "defaultChannel": "rider-assignments-v2"
         }
       ],
       [

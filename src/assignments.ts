@@ -1,4 +1,4 @@
-import type {DeliveryAssignment} from './types';
+import type {DeliveryAssignment, DeliveryRun} from './types';
 
 export type AssignmentSocketPayload = Partial<DeliveryAssignment> & {
   assignmentId?: string;
@@ -15,9 +15,52 @@ export const applyAssignmentSocketEvent = (
     if (!payload.orderNumber || !payload.status) return assignments;
     return [{...payload, _id: id} as DeliveryAssignment, ...assignments];
   }
+  const merged = {...assignments[index], ...payload, _id: id};
+  if (JSON.stringify(assignments[index]) === JSON.stringify(merged)) return assignments;
   const next = [...assignments];
-  next[index] = {...assignments[index], ...payload, _id: id};
+  next[index] = merged;
   return next;
+};
+
+export const applyAssignmentSocketEvents = (
+  assignments: DeliveryAssignment[],
+  payloads: AssignmentSocketPayload[] = [],
+): DeliveryAssignment[] => payloads.reduce(applyAssignmentSocketEvent, assignments);
+
+export const replaceAssignmentsIfChanged = (
+  current: DeliveryAssignment[],
+  next: DeliveryAssignment[],
+): DeliveryAssignment[] => JSON.stringify(current) === JSON.stringify(next) ? current : next;
+
+const stopCompleted = (assignment: DeliveryAssignment) => (
+  assignment.status === 'delivered' || assignment.status === 'delivery_failed'
+);
+
+export const deliveryRunsFromAssignments = (
+  assignments: DeliveryAssignment[],
+): DeliveryRun[] => {
+  const groups = new Map<string, DeliveryAssignment[]>();
+  for (const assignment of assignments) {
+    const id = assignment.deliveryRunId || `legacy-${assignment._id}`;
+    const rows = groups.get(id) || [];
+    rows.push(assignment);
+    groups.set(id, rows);
+  }
+  return [...groups.entries()].map(([id, rows]) => {
+    const orders = [...rows].sort((a, b) => (
+      Number(a.routeSequence || Number.MAX_SAFE_INTEGER) - Number(b.routeSequence || Number.MAX_SAFE_INTEGER)
+      || new Date(a.assignedAt || 0).getTime() - new Date(b.assignedAt || 0).getTime()
+    ));
+    const completedStops = orders.filter(stopCompleted).length;
+    return {
+      id,
+      orders,
+      completedStops,
+      totalStops: orders.length,
+      canReturn: orders.length > 0 && completedStops === orders.length,
+      waitingForPickup: orders.every((order) => order.pickupState === 'queued_at_restaurant'),
+    };
+  });
 };
 
 export const assignmentAddressText = (assignment: DeliveryAssignment): string => {

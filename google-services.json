@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "631628158209",
+    "project_id": "cenciss-delivery",
+    "storage_bucket": "cenciss-delivery.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:631628158209:android:9c6a605e91b38773b17700",
+        "android_client_info": {
+          "package_name": "com.cenciss.rider"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA85ujP79k7OEXdIj081Fwe62HIuOite8U"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

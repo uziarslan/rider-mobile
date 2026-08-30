@@ -2,17 +2,25 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Application from 'expo-application';
 import * as BackgroundTask from 'expo-background-task';
 import * as Battery from 'expo-battery';
+import Constants from 'expo-constants';
 import * as IntentLauncher from 'expo-intent-launcher';
 import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
 import * as TaskManager from 'expo-task-manager';
 import {Linking, Platform} from 'react-native';
 import {API_BASE_URL} from './config';
+import {
+  getNativeTrackingStatus,
+  isNativeTrackingAvailable,
+  startNativeTracking,
+  stopNativeTracking,
+} from './nativeTracking';
 import {getDeviceId, loadSession, saveSession} from './storage';
 import type {AuthSession, GeoLocation, RiderLocationPoint} from './types';
 
 export const LOCATION_TASK_NAME = 'cenciss-rider-background-location';
 export const TRACKING_WATCHDOG_TASK_NAME = 'cenciss-rider-tracking-watchdog';
+export const ASSIGNMENT_NOTIFICATION_CHANNEL_ID = 'rider-assignments-v2';
 const LOCATION_QUEUE_KEY = '@cenciss-rider/location-queue';
 const TRACKING_MODE_KEY = '@cenciss-rider/tracking-mode';
 const TRACKING_HEALTH_KEY = '@cenciss-rider/tracking-health';
@@ -320,6 +328,7 @@ const showAssignmentNotification = async (orderNumber: string) => {
         title: 'New delivery assigned',
         body: `Open order ${orderNumber} and accept it.`,
         sound: 'default',
+        priority: Notifications.AndroidNotificationPriority.MAX,
         data: {screen: 'deliveries'},
       },
       trigger: null,
@@ -432,10 +441,17 @@ Notifications.setNotificationHandler({
 export const configureNotifications = async () => {
   try {
     if (Platform.OS === 'android') {
-      await Notifications.setNotificationChannelAsync('rider-assignments', {
+      await Notifications.setNotificationChannelAsync(ASSIGNMENT_NOTIFICATION_CHANNEL_ID, {
         name: 'Delivery assignments',
-        importance: Notifications.AndroidImportance.HIGH,
-        vibrationPattern: [0, 250, 150, 250],
+        description: 'New delivery assignments and urgent cashier reminders.',
+        importance: Notifications.AndroidImportance.MAX,
+        sound: 'default',
+        enableVibrate: true,
+        vibrationPattern: [0, 450, 180, 450, 180, 700],
+        enableLights: true,
+        lightColor: '#2f66e8',
+        lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+        showBadge: true,
       });
       await Notifications.setNotificationChannelAsync('tracking-alerts', {
         name: 'Tracking service alerts',
@@ -449,6 +465,32 @@ export const configureNotifications = async () => {
     }
   } catch {
     // Notification denial must not prevent GPS or delivery work.
+  }
+};
+
+export type PushRegistration = {granted: boolean; pushToken: string; error: string};
+
+export const registerForPushNotifications = async (): Promise<PushRegistration> => {
+  await configureNotifications();
+  const permission = await Notifications.getPermissionsAsync();
+  if (!permission.granted) return {granted: false, pushToken: '', error: 'Notification permission is disabled.'};
+  const projectId = Constants.easConfig?.projectId
+    || Constants.expoConfig?.extra?.eas?.projectId;
+  if (!projectId) return {granted: true, pushToken: '', error: 'Expo project ID is missing from the installed build.'};
+  try {
+    const token = await Notifications.getExpoPushTokenAsync({projectId});
+    const pushToken = String(token.data || '').trim();
+    return {
+      granted: true,
+      pushToken,
+      error: pushToken ? '' : 'Expo returned an empty push token.',
+    };
+  } catch (error) {
+    return {
+      granted: true,
+      pushToken: '',
+      error: error instanceof Error ? error.message.slice(0, 500) : 'Push token registration failed.',
+    };
   }
 };
 
@@ -533,7 +575,43 @@ const unregisterTrackingWatchdog = async () => {
   }
 };
 
+const configureNativeBackgroundTracking = async () => {
+  const foreground = await Location.getForegroundPermissionsAsync();
+  if (!foreground.granted || foreground.android?.accuracy === 'coarse') {
+    throw new Error('Precise location permission is required before tracking can start.');
+  }
+  if (Platform.OS === 'android' && await isBackgroundTrackingAvailable()) {
+    const background = await Location.getBackgroundPermissionsAsync();
+    if (!background.granted) {
+      throw new Error('Background location permission is required before tracking can start.');
+    }
+  }
+  const session = await loadSession();
+  if (!session) throw new Error('The rider session is required to start background tracking.');
+  return startNativeTracking({
+    apiBaseUrl: API_BASE_URL,
+    accessToken: session.accessToken,
+    deviceId: await getDeviceId(),
+  });
+};
+
 const startBackgroundTracking = async () => {
+  if (isNativeTrackingAvailable()) {
+    // Installed builds use a sticky Android service that records, queues, and
+    // uploads without depending on the React Native JavaScript process.
+    if (await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME).catch(() => false)) {
+      await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME).catch(() => {});
+    }
+    await configureNativeBackgroundTracking();
+    await AsyncStorage.setItem(TRACKING_MODE_KEY, 'background');
+    await updateTrackingHealth({
+      mode: 'background',
+      serviceStartedAt: new Date().toISOString(),
+      lastError: '',
+    });
+    await registerTrackingWatchdog();
+    return 'background' as const;
+  }
   if (!(await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME))) {
     await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, {
       accuracy: Location.Accuracy.High,
@@ -580,6 +658,20 @@ export const startTracking = async (): Promise<TrackingMode> => {
 
 export const isTracking = async (): Promise<TrackingMode> => {
   if (foregroundSubscription) return 'foreground';
+  const nativeStatus = await getNativeTrackingStatus();
+  if (nativeStatus?.active) {
+    const foreground = await Location.getForegroundPermissionsAsync();
+    if (!foreground.granted || foreground.android?.accuracy === 'coarse') {
+      await recordTrackingError('Precise location permission is required before tracking can start.');
+      return 'stopped';
+    }
+    const background = await Location.getBackgroundPermissionsAsync().catch(() => ({granted: false} as Location.PermissionResponse));
+    if (!background.granted) {
+      await recordTrackingError('Background location permission is required before tracking can start.');
+      return 'stopped';
+    }
+    return 'background';
+  }
   try {
     if (await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME)) return 'background';
   } catch {
@@ -594,9 +686,28 @@ export const isTracking = async (): Promise<TrackingMode> => {
 };
 
 export const getTrackingHealth = async (): Promise<TrackingHealth> => {
-  const [queue, power] = await Promise.all([loadLocationQueue(), powerRestrictions()]);
-  const health = await updateTrackingHealth(power);
-  return {...health, queueDepth: queue.length};
+  const [queue, power, nativeStatus, foreground, background] = await Promise.all([
+    loadLocationQueue(),
+    powerRestrictions(),
+    getNativeTrackingStatus(),
+    Location.getForegroundPermissionsAsync(),
+    Location.getBackgroundPermissionsAsync().catch(() => ({granted: false} as Location.PermissionResponse)),
+  ]);
+  const nativeUsable = Boolean(nativeStatus?.active && foreground.granted && foreground.android?.accuracy !== 'coarse' && background.granted);
+  const nativeHealth = nativeUsable && nativeStatus ? {
+    mode: 'background' as const,
+    lastTaskCallbackAt: nativeStatus.lastLocationAt > 0
+      ? new Date(nativeStatus.lastLocationAt).toISOString()
+      : undefined,
+    lastUploadAt: nativeStatus.lastUploadAt > 0
+      ? new Date(nativeStatus.lastUploadAt).toISOString()
+      : undefined,
+    lastError: nativeStatus.lastError,
+    queueDepth: nativeStatus.queueDepth,
+    consecutiveUploadFailures: nativeStatus.consecutiveFailures,
+  } : {};
+  const health = await updateTrackingHealth({...power, ...nativeHealth});
+  return {...health, queueDepth: nativeUsable && nativeStatus ? nativeStatus.queueDepth : queue.length};
 };
 
 export const trackingHeartbeatPayload = async () => {
@@ -611,7 +722,8 @@ export const trackingHeartbeatPayload = async () => {
   const locationPermission = !foreground.granted
     ? 'denied'
     : permissionAccuracy === 'coarse' ? 'approximate' : 'precise';
-  const health = await updateTrackingHealth({mode, backgroundLocationGranted: background.granted, ...power});
+  await updateTrackingHealth({mode, backgroundLocationGranted: background.granted, ...power});
+  const health = await getTrackingHealth();
   return {
     deviceId: await getDeviceId(),
     batteryLevel: level,
@@ -653,6 +765,17 @@ async function runTrackingWatchdog() {
 
   const watchdogAt = new Date().toISOString();
   await updateTrackingHealth({lastWatchdogAt: watchdogAt});
+  if (isNativeTrackingAvailable()) {
+    try {
+      // Calling start again is idempotent and refreshes the service's server
+      // URL and access token after the app session has been renewed.
+      await configureNativeBackgroundTracking();
+      return BackgroundTask.BackgroundTaskResult.Success;
+    } catch (error) {
+      await recordTrackingError(error);
+      return BackgroundTask.BackgroundTaskResult.Failed;
+    }
+  }
   try {
     if (!(await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME))) {
       await startBackgroundTracking();
@@ -692,6 +815,27 @@ async function runTrackingWatchdog() {
 }
 
 export const ensureTrackingHealthy = async (): Promise<TrackingRepairResult> => {
+  const readiness = await getTrackingReadiness();
+  if (!readiness.foregroundGranted || !readiness.preciseLocation) {
+    const error = new Error('Precise location permission is required before tracking can start.');
+    await recordTrackingError(error);
+    throw error;
+  }
+  if (readiness.backgroundAvailable && !readiness.backgroundGranted) {
+    const error = new Error('Background location permission is required before tracking can start.');
+    await recordTrackingError(error);
+    throw error;
+  }
+  if (isNativeTrackingAvailable()) {
+    const status = await getNativeTrackingStatus();
+    try {
+      const mode = await startBackgroundTracking();
+      return {mode, restarted: !status?.active};
+    } catch (error) {
+      await recordTrackingError(error);
+      throw error;
+    }
+  }
   const mode = await isTracking();
   if (mode === 'stopped') {
     try {
@@ -723,6 +867,7 @@ export const ensureTrackingHealthy = async (): Promise<TrackingRepairResult> => 
 export const stopTracking = async () => {
   foregroundSubscription?.remove();
   foregroundSubscription = null;
+  await stopNativeTracking().catch(() => false);
   try {
     if (await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME)) {
       await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);

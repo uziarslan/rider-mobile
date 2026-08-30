@@ -1,4 +1,4 @@
-import React, {useCallback, useEffect, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   ActivityIndicator,
   AppState,
@@ -27,14 +27,16 @@ import {ApiError, apiRequest, configureApiSession, logoutRider, riderLogin} from
 import {API_BASE_URL} from './src/config';
 import {
   applyAssignmentSocketEvent,
+  applyAssignmentSocketEvents,
   assignmentAddressText,
   assignmentMapsQuery,
   assignmentWhatsAppUrl,
+  deliveryRunsFromAssignments,
+  replaceAssignmentsIfChanged,
   type AssignmentSocketPayload,
 } from './src/assignments';
 import {getDeviceId, loadPendingActions, loadSession, savePendingActions} from './src/storage';
 import {
-  configureNotifications,
   ensureTrackingHealthy,
   flushLocationQueue,
   getCurrentLocation,
@@ -44,14 +46,16 @@ import {
   openBatterySettings,
   openLocationSettings,
   openPowerSaverSettings,
+  registerForPushNotifications,
   requestTrackingPermissions,
   startTracking,
   stopTracking,
   trackingHeartbeatPayload,
   type TrackingHealth,
   type TrackingMode,
+  type PushRegistration,
 } from './src/tracking';
-import type {AuthSession, DeliveryAssignment, GeoLocation, PendingAction, RiderBootstrap} from './src/types';
+import type {AuthSession, DeliveryAssignment, DeliveryRun, GeoLocation, PendingAction, RiderBootstrap} from './src/types';
 
 type Tab = 'home' | 'deliveries' | 'profile';
 type RiderAction = PendingAction['action'];
@@ -72,8 +76,6 @@ const ACTIONS: Record<string, {action: RiderAction; label: string; tone?: 'dange
   assigned: [{action: 'accept', label: 'Accept'}],
   accepted: [{action: 'picked_up', label: 'Picked Up'}],
   picked_up: [{action: 'delivered', label: 'Delivered', tone: 'success'}, {action: 'delivery_failed', label: 'Delivery Failed', tone: 'danger'}],
-  delivered: [{action: 'returned_to_restaurant', label: 'Returned to Restaurant', tone: 'success'}],
-  delivery_failed: [{action: 'returned_to_restaurant', label: 'Returned to Restaurant'}],
 };
 const NEXT_STATUS: Record<RiderAction, DeliveryAssignment['status']> = {
   accept: 'accepted', picked_up: 'picked_up', delivered: 'delivered', delivery_failed: 'delivery_failed', returned_to_restaurant: 'returned_to_restaurant',
@@ -81,6 +83,18 @@ const NEXT_STATUS: Record<RiderAction, DeliveryAssignment['status']> = {
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : 'Something went wrong.';
 const humanStatus = (value?: string) => String(value || 'unknown').replaceAll('_', ' ');
+const displayedOrderStatus = (assignment: DeliveryAssignment) => (
+  assignment.status === 'returned_to_restaurant' && assignment.deliveryOutcome
+    ? assignment.deliveryOutcome
+    : assignment.status
+);
+const pickupLabel = (value?: DeliveryAssignment['pickupState']) => ({
+  queued_at_restaurant: 'Waiting at restaurant',
+  ready_for_pickup: 'Ready in this pickup',
+  with_rider: 'With you',
+  delivery_stop_completed: 'Stop completed',
+  completed: 'Run completed',
+}[value || 'queued_at_restaurant']);
 const money = (value?: number) => `PKR ${Number(value || 0).toLocaleString('en-PK')}`;
 const formatTime = (value?: string) => value ? new Date(value).toLocaleString() : '—';
 const formatTrackingTime = (value?: string) => value ? new Date(value).toLocaleTimeString() : 'Waiting for signal';
@@ -141,8 +155,8 @@ const DeliveryCard = ({assignment, busy, onAction, onViewDetails, showDialog}: {
   return (
     <View style={styles.deliveryCard}>
       <Pressable onPress={() => onViewDetails(assignment)} style={styles.rowBetween} accessibilityRole="button" accessibilityLabel={`View order ${assignment.orderNumber} information`}>
-        <View style={styles.flexOne}><Text style={styles.eyebrow}>DELIVERY ORDER</Text><Text style={styles.orderNumber}>{assignment.orderNumber}</Text></View>
-        <Badge tone={assignment.status === 'delivery_failed' ? 'warn' : assignment.active ? 'info' : 'good'}>{humanStatus(assignment.status)}</Badge>
+        <View style={styles.flexOne}><Text style={styles.eyebrow}>DELIVERY ORDER{assignment.routeSequence ? ` · STOP ${assignment.routeSequence}` : ''}</Text><Text style={styles.orderNumber}>{assignment.orderNumber}</Text><Text style={styles.runState}>{pickupLabel(assignment.pickupState)}</Text></View>
+        <Badge tone={displayedOrderStatus(assignment) === 'delivery_failed' ? 'warn' : assignment.active ? 'info' : 'good'}>{humanStatus(displayedOrderStatus(assignment))}</Badge>
       </Pressable>
       <View style={styles.divider} />
       <Text style={styles.customerName}>{assignment.customerName || 'Delivery customer'}</Text>
@@ -155,7 +169,12 @@ const DeliveryCard = ({assignment, busy, onAction, onViewDetails, showDialog}: {
           <Text style={styles.orderItemAmount}>{money(item.lineTotal)}</Text>
         </View>)}
       </View>}
-      <View style={styles.orderMeta}><Text style={styles.metaText}>{money(assignment.totalAmount)}</Text><Text style={styles.metaText}>Assigned {formatTime(assignment.assignedAt)}</Text></View>
+      <View style={styles.collectionBox}>
+        <View style={styles.collectionRow}><Text style={styles.collectionLabel}>Delivery charges to collect</Text><Text style={styles.collectionValue}>{money(assignment.deliveryChargeAmount)}</Text></View>
+        <View style={[styles.collectionRow, styles.collectionTotalRow]}><Text style={styles.collectionTotalLabel}>Total to collect</Text><Text style={styles.collectionTotalValue}>{money(assignment.totalAmount)}</Text></View>
+      </View>
+      <View style={styles.orderMeta}><Text style={styles.metaText}>Assigned {formatTime(assignment.assignedAt)}</Text></View>
+      {assignment.runReturnedAt ? <Text style={styles.runReturnedText}>Delivery run returned {formatTime(assignment.runReturnedAt)}</Text> : null}
       {assignment.notes ? <View style={styles.noteBox}><Text style={styles.noteLabel}>ORDER NOTE</Text><Text style={styles.noteText}>{assignment.notes}</Text></View> : null}
       <Pressable style={styles.detailsButton} onPress={() => onViewDetails(assignment)}><Text style={styles.detailsButtonText}>View Order Information</Text></Pressable>
       <Pressable style={styles.mapButton} onPress={() => openMaps(assignment, showDialog)}><Text style={styles.mapButtonText}>Open in Google Maps</Text></Pressable>
@@ -168,6 +187,37 @@ const DeliveryCard = ({assignment, busy, onAction, onViewDetails, showDialog}: {
   );
 };
 
+const DeliveryRunHeader = ({run, busy, onReturn}: {run: DeliveryRun; busy: boolean; onReturn: (run: DeliveryRun) => void}) => (
+  <View style={styles.runCard}>
+    <View style={styles.rowBetween}>
+      <View style={styles.flexOne}>
+        <Text style={styles.runEyebrow}>CONNECTED DELIVERY RUN</Text>
+        <Text style={styles.runTitle}>{run.completedStops} of {run.totalStops} stops completed</Text>
+      </View>
+      <Badge tone={run.canReturn ? 'good' : 'info'}>{run.canReturn ? 'RETURN READY' : 'IN PROGRESS'}</Badge>
+    </View>
+    <View style={styles.runPath}>
+      <View style={styles.runNode}><Text style={styles.runNodeText}>A</Text></View>
+      {run.orders.map((order, index) => (
+        <React.Fragment key={order._id}>
+          <View style={[styles.runLine, ['delivered', 'delivery_failed'].includes(order.status) && styles.runLineDone]} />
+          <View style={[styles.runNode, ['delivered', 'delivery_failed'].includes(order.status) && styles.runNodeDone]}>
+            <Text style={styles.runNodeText}>{String.fromCharCode(66 + index)}</Text>
+          </View>
+        </React.Fragment>
+      ))}
+    </View>
+    <Text style={styles.runHelp}>{run.orders.map((order) => order.orderNumber).join(' → ')}</Text>
+    {run.canReturn ? (
+      <Pressable disabled={busy} onPress={() => onReturn(run)} style={({pressed}) => [styles.runReturnButton, (busy || pressed) && styles.buttonDisabled]}>
+        <Text style={styles.runReturnText}>{busy ? 'Completing Run…' : 'Returned to Restaurant'}</Text>
+      </Pressable>
+    ) : (
+      <Text style={styles.runPendingText}>Complete each customer stop separately. Returning becomes available only after every stop is completed.</Text>
+    )}
+  </View>
+);
+
 const OrderDetailsModal = ({assignment, loading, onClose, showDialog}: {assignment: DeliveryAssignment | null; loading: boolean; onClose: () => void; showDialog: ShowDialog}) => {
   const insets = useSafeAreaInsets();
   if (!assignment) return null;
@@ -177,14 +227,17 @@ const OrderDetailsModal = ({assignment, loading, onClose, showDialog}: {assignme
         <View style={styles.detailsTopBar}><View style={styles.flexOne}><Text style={styles.eyebrow}>DELIVERY ORDER</Text><Text style={styles.detailsOrderNumber}>{assignment.orderNumber}</Text></View><Pressable onPress={onClose} style={styles.detailsCloseIcon}><Text style={styles.detailsCloseIconText}>×</Text></Pressable></View>
         {loading ? <View style={styles.detailsLoading}><ActivityIndicator color="#4f46e5" /><Text style={styles.detailsLoadingText}>Loading latest order information…</Text></View> : null}
         <ScrollView style={styles.detailsScroll} contentContainerStyle={styles.detailsContent}>
-          <View style={styles.detailsSection}><Text style={styles.detailsSectionTitle}>STATUS</Text><Badge tone={assignment.status === 'delivery_failed' ? 'warn' : assignment.active ? 'info' : 'good'}>{humanStatus(assignment.status)}</Badge></View>
+          <View style={styles.detailsSection}><Text style={styles.detailsSectionTitle}>STATUS</Text><Badge tone={displayedOrderStatus(assignment) === 'delivery_failed' ? 'warn' : assignment.active ? 'info' : 'good'}>{humanStatus(displayedOrderStatus(assignment))}</Badge>{assignment.runReturnedAt ? <Text style={styles.runReturnedText}>Run returned to restaurant {formatTime(assignment.runReturnedAt)}</Text> : null}</View>
           <View style={styles.detailsSection}><Text style={styles.detailsSectionTitle}>CUSTOMER</Text><Text style={styles.detailsCustomer}>{assignment.customerName || 'No customer name recorded'}</Text>{assignment.customerPhone ? <><View style={styles.customerPhoneRow}><Ionicons name="call-outline" size={16} color="#475569" /><Text style={styles.customerPhone}>{assignment.customerPhone}</Text></View><View style={styles.contactActions}><Pressable onPress={() => Linking.openURL(`tel:${assignment.customerPhone}`).catch(() => showDialog({title: 'Phone unavailable', message: 'Could not open the phone application.'}))} style={styles.callButton}><Text style={styles.callButtonText}>Call</Text></Pressable><Pressable onPress={() => openWhatsApp(assignment, showDialog)} style={styles.whatsappButton}><Text style={styles.whatsappButtonText}>WhatsApp</Text></Pressable></View></> : <Text style={styles.detailsMissing}>No customer phone recorded</Text>}</View>
           <View style={styles.detailsSection}><Text style={styles.detailsSectionTitle}>DELIVERY ADDRESS</Text><Text style={styles.detailsAddress}>{addressText(assignment)}</Text><Pressable style={styles.mapButton} onPress={() => openMaps(assignment, showDialog)}><Text style={styles.mapButtonText}>Open in Google Maps</Text></Pressable></View>
           <View style={styles.detailsSection}><View style={styles.orderItemsHeader}><Text style={styles.detailsSectionTitle}>ORDER ITEMS</Text><Text style={styles.orderItemsCount}>{assignment.items?.length || 0}</Text></View>
             {(assignment.items || []).length > 0 ? assignment.items?.map((item, index) => <View key={`${item.menuItem || item.name}-${item.variation?.id || item.variation?.name || ''}-${index}`} style={[styles.detailsItemRow, index > 0 && styles.orderItemDivider]}><View style={styles.orderItemMain}><Text style={styles.orderItemName}>{item.qty} × {item.name}</Text>{item.variation?.name ? <Text style={styles.orderItemVariation}>{item.variation.name}</Text> : null}{item.notes ? <Text style={styles.orderItemNote}>{item.notes}</Text> : null}</View><Text style={styles.orderItemAmount}>{money(item.lineTotal)}</Text></View>) : <Text style={styles.detailsMissing}>No order items were returned by the server.</Text>}
           </View>
           {assignment.notes ? <View style={styles.detailsSection}><Text style={styles.detailsSectionTitle}>ORDER NOTE</Text><Text style={styles.noteText}>{assignment.notes}</Text></View> : null}
-          <View style={styles.detailsTotal}><Text style={styles.detailsTotalLabel}>Order total</Text><Text style={styles.detailsTotalValue}>{money(assignment.totalAmount)}</Text></View>
+          <View style={styles.detailsCollection}>
+            <View style={styles.collectionRow}><Text style={styles.detailsChargeLabel}>Delivery charges to collect</Text><Text style={styles.detailsChargeValue}>{money(assignment.deliveryChargeAmount)}</Text></View>
+            <View style={[styles.collectionRow, styles.detailsCollectionTotal]}><Text style={styles.detailsTotalLabel}>Total to collect from customer</Text><Text style={styles.detailsTotalValue}>{money(assignment.totalAmount)}</Text></View>
+          </View>
         </ScrollView>
         <Pressable onPress={onClose} style={styles.detailsCloseButton}><Text style={styles.detailsCloseButtonText}>Close</Text></Pressable>
       </View>
@@ -233,6 +286,10 @@ const RiderApp = () => {
   const [selectedOrder, setSelectedOrder] = useState<DeliveryAssignment | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [dialog, setDialog] = useState<AppDialog | null>(null);
+  const [pushRegistration, setPushRegistration] = useState<PushRegistration | null>(null);
+  const handledNotificationRef = useRef('');
+  const registeringDeviceRef = useRef(false);
+  const businessDateRef = useRef('');
   const showDialog = useCallback<ShowDialog>((next) => setDialog(next), []);
   const closeDialog = useCallback(() => setDialog(null), []);
 
@@ -243,6 +300,45 @@ const RiderApp = () => {
   }, []);
   const selectTab = (next: Tab) => { setTab(next); AsyncStorage.setItem(LAST_TAB_KEY, next).catch(() => {}); };
 
+  useEffect(() => { businessDateRef.current = businessDate; }, [businessDate]);
+
+  const applyOrderPayloads = useCallback((payloads: AssignmentSocketPayload[]) => {
+    if (!payloads.length) return;
+    setOrders(current => {
+      const next = applyAssignmentSocketEvents(current, payloads)
+        .filter(order => order.active || !businessDateRef.current || !order.businessDate || order.businessDate === businessDateRef.current);
+      return replaceAssignmentsIfChanged(current, next);
+    });
+    setBootstrap(current => {
+      if (!current) return current;
+      const assignments = applyAssignmentSocketEvents(current.assignments || [], payloads);
+      return assignments === current.assignments ? current : {...current, assignments};
+    });
+    setSelectedOrder(current => {
+      if (!current) return current;
+      const relevant = payloads.filter(payload => String(payload._id || payload.assignmentId || '') === current._id);
+      if (!relevant.length) return current;
+      return applyAssignmentSocketEvents([current], relevant)[0] || current;
+    });
+  }, []);
+
+  const refreshOrders = useCallback(async () => {
+    if (!session) return;
+    const response = await apiRequest<{data: DeliveryAssignment[]; businessDate?: string}>('/api/rider/orders?history=true');
+    const nextOrders = response.data || [];
+    if (response.businessDate) {
+      businessDateRef.current = response.businessDate;
+      setBusinessDate(current => current === response.businessDate ? current : response.businessDate || '');
+    }
+    setOrders(current => replaceAssignmentsIfChanged(current, nextOrders));
+    setSelectedOrder(current => {
+      if (!current) return current;
+      const latest = nextOrders.find(order => order._id === current._id);
+      if (!latest) return null;
+      return JSON.stringify(latest) === JSON.stringify(current) ? current : latest;
+    });
+  }, [session]);
+
   const refreshAll = useCallback(async ({quiet = false}: {quiet?: boolean} = {}) => {
     if (!session) return;
     if (!quiet) setRefreshing(true);
@@ -251,8 +347,17 @@ const RiderApp = () => {
         apiRequest<{data: RiderBootstrap}>('/api/rider/bootstrap'), apiRequest<{data: DeliveryAssignment[]; businessDate?: string}>('/api/rider/orders?history=true'),
       ]);
       const nextOrders = ordersResponse.data || [];
-      setBootstrap(bootstrapResponse.data); setBusinessDate(ordersResponse.businessDate || bootstrapResponse.data.businessDate || ''); setOrders(nextOrders);
-      setSelectedOrder(current => current && !nextOrders.some(order => order._id === current._id) ? null : current);
+      const nextBusinessDate = ordersResponse.businessDate || bootstrapResponse.data.businessDate || '';
+      businessDateRef.current = nextBusinessDate;
+      setBootstrap(current => JSON.stringify(current) === JSON.stringify(bootstrapResponse.data) ? current : bootstrapResponse.data);
+      setBusinessDate(current => current === nextBusinessDate ? current : nextBusinessDate);
+      setOrders(current => replaceAssignmentsIfChanged(current, nextOrders));
+      setSelectedOrder(current => {
+        if (!current) return current;
+        const latest = nextOrders.find(order => order._id === current._id);
+        if (!latest) return null;
+        return JSON.stringify(latest) === JSON.stringify(current) ? current : latest;
+      });
       const currentMode = await isTracking(); setTrackingMode(currentMode);
       if (bootstrapResponse.data.shift) {
         try {
@@ -275,37 +380,96 @@ const RiderApp = () => {
     configureApiSession(session, setSession);
     const initialRefresh = setTimeout(() => { refreshAll(); }, 0);
     const socket = io(API_BASE_URL, {transports: ['websocket', 'polling'], auth: {token: session.accessToken}, reconnection: true});
-    const join = () => { socket.emit('rider:join'); refreshAll({quiet: true}); };
+    const join = () => { socket.emit('rider:join'); refreshOrders().catch(() => {}); };
     const updateFromSocket = (payload?: AssignmentSocketPayload) => {
       const hasFullAssignment = Boolean(payload?._id && payload.orderNumber && payload.status);
-      if (!hasFullAssignment) { refreshAll({quiet: true}); return; }
-      setOrders(current => applyAssignmentSocketEvent(current, payload).filter(order => order.active || !businessDate || !order.businessDate || order.businessDate === businessDate));
-      setBootstrap(current => current ? {...current, assignments: applyAssignmentSocketEvent(current.assignments || [], payload)} : current);
-      setSelectedOrder(current => current ? applyAssignmentSocketEvent([current], payload)[0] : current);
+      if (!hasFullAssignment) { refreshOrders().catch(() => {}); return; }
+      applyOrderPayloads([payload!]);
     };
     socket.on('connect', join);
     if (socket.connected) join();
     const reminder = (payload?: {orderNumber?: string}) => {
       showDialog({title: 'Delivery reminder', message: `Please review order ${payload?.orderNumber || ''}.`.trim(), primaryLabel: 'View Deliveries', onPrimary: () => selectTab('deliveries')});
-      refreshAll({quiet: true});
+      refreshOrders().catch(() => {});
     };
     ['rider-assignment:new', 'rider-assignment:updated', 'rider-assignment:reassigned'].forEach(event => socket.on(event, updateFromSocket));
+    const updateRun = (payload?: {assignments?: AssignmentSocketPayload[]}) => {
+      if (payload?.assignments?.length) applyOrderPayloads(payload.assignments);
+      else refreshOrders().catch(() => {});
+    };
+    socket.on('rider-run:updated', updateRun);
     socket.on('rider-tracking:disabled', () => refreshAll({quiet: true}));
     socket.on('rider-assignment:reminder', reminder);
-    const appStateSubscription = AppState.addEventListener('change', state => { if (state === 'active') refreshAll({quiet: true}); });
-    const timer = setInterval(() => refreshAll({quiet: true}), 30_000);
+    const appStateSubscription = AppState.addEventListener('change', state => { if (state === 'active') refreshOrders().catch(() => {}); });
+    const timer = setInterval(() => refreshOrders().catch(() => {}), 60_000);
     return () => { clearTimeout(initialRefresh); clearInterval(timer); appStateSubscription.remove(); socket.disconnect(); };
-  }, [businessDate, refreshAll, session, showDialog]);
+  }, [applyOrderPayloads, refreshAll, refreshOrders, session, showDialog]);
+
+  const registerDevice = useCallback(async () => {
+    if (!session || registeringDeviceRef.current) return false;
+    registeringDeviceRef.current = true;
+    try {
+      const [deviceId, notificationRegistration, tracking] = await Promise.all([
+        getDeviceId(),
+        registerForPushNotifications(),
+        trackingHeartbeatPayload().catch(() => ({})),
+      ]);
+      setPushRegistration(notificationRegistration);
+      await apiRequest('/api/rider/devices/register', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...tracking,
+          deviceId,
+          manufacturer: Device.manufacturer,
+          model: Device.modelName,
+          osVersion: Device.osVersion,
+          appVersion: APP_VERSION,
+          ...(notificationRegistration.pushToken ? {pushToken: notificationRegistration.pushToken} : {}),
+          pushRegistrationError: notificationRegistration.error,
+          notificationsEnabled: notificationRegistration.granted,
+        }),
+      });
+      return Boolean(notificationRegistration.pushToken);
+    } catch (error) {
+      setPushRegistration((current) => ({
+        granted: current?.granted ?? false,
+        pushToken: current?.pushToken || '',
+        error: errorMessage(error),
+      }));
+      return false;
+    } finally {
+      registeringDeviceRef.current = false;
+    }
+  }, [session]);
 
   useEffect(() => {
-    if (!session) return;
-    getDeviceId().then(async deviceId => { try {
-      await configureNotifications();
-      const notificationPermission = await Notifications.getPermissionsAsync();
-      const tracking = await trackingHeartbeatPayload();
-      await apiRequest('/api/rider/devices/register', {method: 'POST', body: JSON.stringify({...tracking, deviceId, manufacturer: Device.manufacturer, model: Device.modelName, osVersion: Device.osVersion, appVersion: APP_VERSION, notificationsEnabled: notificationPermission.granted})});
-    } catch { /* Re-register on the next app launch. */ } });
-  }, [session]);
+    if (!session) return undefined;
+    let active = true;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let retryIndex = 0;
+    const retryDelays = [5_000, 30_000, 120_000, 300_000];
+    const attempt = async () => {
+      const registered = await registerDevice();
+      if (!active || registered) return;
+      const delay = retryDelays[Math.min(retryIndex, retryDelays.length - 1)];
+      retryIndex += 1;
+      retryTimer = setTimeout(attempt, delay);
+    };
+    attempt();
+    const appStateSubscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        retryIndex = 0;
+        attempt();
+      }
+    });
+    const refreshTimer = setInterval(() => registerDevice(), 15 * 60_000);
+    return () => {
+      active = false;
+      if (retryTimer) clearTimeout(retryTimer);
+      clearInterval(refreshTimer);
+      appStateSubscription.remove();
+    };
+  }, [registerDevice, session]);
 
   useEffect(() => {
     if (!session || !bootstrap?.shift) return undefined;
@@ -317,8 +481,8 @@ const RiderApp = () => {
     if (!session || !(await NetInfo.fetch()).isConnected) return;
     const queued = await loadPendingActions(); if (!queued.length) return; const remaining: PendingAction[] = [];
     for (const item of queued) { try { await apiRequest(`/api/rider/orders/${item.assignmentId}/action`, {method: 'PATCH', body: JSON.stringify({action: item.action, clientEventId: item.clientEventId, location: item.location})}); } catch (error) { if (!(error instanceof ApiError) || error.status === 0 || error.status >= 500) remaining.push(item); } }
-    setPendingActions(remaining); await savePendingActions(remaining); if (remaining.length !== queued.length) refreshAll({quiet: true});
-  }, [refreshAll, session]);
+    setPendingActions(remaining); await savePendingActions(remaining); if (remaining.length !== queued.length) refreshOrders().catch(() => {});
+  }, [refreshOrders, session]);
   useEffect(() => {
     const unsubscribe = NetInfo.addEventListener(state => {
       if (state.isConnected) {
@@ -343,6 +507,38 @@ const RiderApp = () => {
       setDetailsLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (!session) return undefined;
+    const openNotification = async (response: Notifications.NotificationResponse | null) => {
+      if (!response) return;
+      const request = response.notification.request;
+      const responseKey = `${request.identifier}:${response.actionIdentifier}`;
+      if (handledNotificationRef.current === responseKey) return;
+      handledNotificationRef.current = responseKey;
+      const data = request.content.data || {};
+      selectTab('deliveries');
+      const assignmentId = String(data.assignmentId || '').trim();
+      if (!assignmentId) {
+        await refreshOrders();
+        return;
+      }
+      setDetailsLoading(true);
+      try {
+        const result = await apiRequest<{data: DeliveryAssignment}>(`/api/rider/orders/${assignmentId}`);
+        setOrders(current => applyAssignmentSocketEvent(current, result.data));
+        setSelectedOrder(result.data);
+      } catch {
+        await refreshOrders();
+      } finally {
+        setDetailsLoading(false);
+        Notifications.clearLastNotificationResponseAsync().catch(() => {});
+      }
+    };
+    Notifications.getLastNotificationResponseAsync().then(openNotification).catch(() => {});
+    const subscription = Notifications.addNotificationResponseReceivedListener(openNotification);
+    return () => subscription.remove();
+  }, [refreshOrders, session]);
 
   const startDuty = async () => {
     setDutyBusy(true);
@@ -375,7 +571,7 @@ const RiderApp = () => {
     } catch (error) { showDialog({title: 'Could not start duty', message: errorMessage(error)}); } finally { setDutyBusy(false); }
   };
   const endDuty = async () => {
-    const activeOrder = orders.find(order => order.active); if (activeOrder) { showDialog({title: 'Delivery still active', message: `Complete or return order ${activeOrder.orderNumber} before ending duty.`}); return; }
+    const activeOrders = orders.filter(order => order.active); if (activeOrders.length) { showDialog({title: 'Deliveries still active', message: `Complete or return ${activeOrders.length} active order${activeOrders.length === 1 ? '' : 's'} before ending duty.`}); return; }
     showDialog({title: 'End duty?', message: 'Your continuous GPS tracking will stop.', primaryLabel: 'End Duty', secondaryLabel: 'Cancel', destructive: true, onPrimary: async () => {
       setDutyBusy(true); try { await flushLocationQueue(); const location = await currentLocation(); await apiRequest('/api/rider/shifts/end', {method: 'POST', body: JSON.stringify({location, reason: 'Rider ended duty'})}); await stopTracking(); setTrackingMode('stopped'); setTrackingHealth(await getTrackingHealth()); await refreshAll({quiet: true}); } catch (error) { showDialog({title: 'Could not end duty', message: errorMessage(error)}); } finally { setDutyBusy(false); }
     }});
@@ -424,14 +620,28 @@ const RiderApp = () => {
     const pending: PendingAction = {id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, assignmentId: assignment._id, action, clientEventId: `${assignment._id}-${Date.now()}-${Math.random().toString(36).slice(2)}`, location: await currentLocation(), queuedAt: new Date().toISOString()};
     try {
       if (!(await NetInfo.fetch()).isConnected) throw new ApiError('No connection to the tracking server.');
-      await apiRequest(`/api/rider/orders/${assignment._id}/action`, {method: 'PATCH', body: JSON.stringify(pending)}); await refreshAll({quiet: true});
+      const response = await apiRequest<{data: DeliveryAssignment; assignments?: DeliveryAssignment[]}>(`/api/rider/orders/${assignment._id}/action`, {method: 'PATCH', body: JSON.stringify(pending)});
+      applyOrderPayloads(response.assignments?.length ? response.assignments : [response.data]);
     } catch (error) {
-      if (error instanceof ApiError && error.status === 0) {
+      if (error instanceof ApiError && error.status === 0 && action !== 'returned_to_restaurant') {
         const next = [...pendingActions, pending]; setPendingActions(next); await savePendingActions(next);
         setOrders(current => current.map(order => order._id === assignment._id ? {...order, status: NEXT_STATUS[action], active: NEXT_STATUS[action] !== 'returned_to_restaurant'} : order));
         showDialog({title: 'Saved offline', message: 'This action is queued and will sync automatically when the connection returns.'});
+      } else if (error instanceof ApiError && error.status === 0) {
+        showDialog({title: 'Connection required', message: 'Restaurant return needs a live GPS and server check. Reconnect and try again inside the outlet geofence.'});
       } else showDialog({title: 'Action not saved', message: errorMessage(error)});
     } finally { setActionBusy(''); }
+  };
+  const returnDeliveryRun = (run: DeliveryRun) => {
+    const assignment = run.orders[0];
+    if (!assignment || !run.canReturn) return;
+    showDialog({
+      title: 'Confirm delivery run return?',
+      message: `All ${run.totalStops} customer stops are complete. Confirm only when you and all orders in this run are physically back inside the restaurant geofence.`,
+      primaryLabel: 'Complete Run',
+      secondaryLabel: 'Cancel',
+      onPrimary: () => submitAction(assignment, 'returned_to_restaurant'),
+    });
   };
   const signOut = () => {
     if (bootstrap?.shift) { showDialog({title: 'End duty first', message: 'You cannot sign out while duty tracking is active.'}); return; }
@@ -440,7 +650,15 @@ const RiderApp = () => {
 
   if (initializing) return <View style={styles.loadingPage}><StatusBar barStyle="dark-content" /><ActivityIndicator size="large" color="#4f46e5" /><Text style={styles.loadingText}>Loading Cenciss Delivery…</Text></View>;
   if (!session) return <><LoginScreen onLogin={next => { configureApiSession(next, setSession); setSession(next); }} showDialog={showDialog} /><AppDialogModal dialog={dialog} onClose={closeDialog} /></>;
-  const activeOrders = orders.filter(order => order.active); const historyOrders = orders.filter(order => !order.active); const currentOrder = activeOrders[0];
+  const activeOrders = orders.filter(order => order.active).sort((a, b) => {
+    const rank = {with_rider: 0, delivery_stop_completed: 1, ready_for_pickup: 2, queued_at_restaurant: 3, completed: 4};
+    return (rank[a.pickupState || 'queued_at_restaurant'] - rank[b.pickupState || 'queued_at_restaurant'])
+      || new Date(a.assignedAt || 0).getTime() - new Date(b.assignedAt || 0).getTime();
+  });
+  const historyOrders = orders.filter(order => !order.active);
+  const currentRunOrders = activeOrders.filter(order => order.pickupState !== 'queued_at_restaurant');
+  const currentDeliveryRuns = deliveryRunsFromAssignments(currentRunOrders);
+  const waitingAtRestaurant = activeOrders.filter(order => order.pickupState === 'queued_at_restaurant');
   const trackingActive = trackingMode !== 'stopped';
   const batteryRestricted = trackingHealth.batteryOptimizationEnabled === true;
   const lowPowerRestricted = trackingHealth.lowPowerMode === true;
@@ -465,12 +683,15 @@ const RiderApp = () => {
             {bootstrap?.shift ? <><View style={styles.shiftStats}><View><Text style={styles.shiftValue}>{distanceText(bootstrap.shift.distanceMeters)}</Text><Text style={styles.shiftLabel}>Distance</Text></View><View><Text style={styles.shiftValue}>{bootstrap.shift.pointCount || 0}</Text><Text style={styles.shiftLabel}>GPS points</Text></View><View><Text style={styles.shiftValue}>{bootstrap.shift.inOutletGeofence == null ? '—' : bootstrap.shift.inOutletGeofence ? 'Inside' : 'Outside'}</Text><Text style={styles.shiftLabel}>Outlet zone</Text></View></View>{trackingMode === 'foreground' && <Text style={styles.dutyHelp}>Expo Go mode: keep the app open for GPS updates. The installed APK tracks with the screen locked.</Text>}</> : <Text style={styles.dutyHelp}>Starting duty enables route tracking. Expo Go tracks while open; the installed APK continues while the screen is locked.</Text>}
             <Pressable disabled={dutyBusy} onPress={bootstrap?.shift ? endDuty : startDuty} style={({pressed}) => [styles.dutyButton, bootstrap?.shift && styles.endDutyButton, (pressed || dutyBusy) && styles.buttonDisabled]}>{dutyBusy ? <ActivityIndicator color={bootstrap?.shift ? '#ef4444' : '#fff'} /> : <Text style={[styles.dutyButtonText, bootstrap?.shift && styles.endDutyText]}>{bootstrap?.shift ? 'End Duty' : 'Start Duty'}</Text>}</Pressable>
           </View>
-          <View style={styles.sectionHeader}><Text style={styles.sectionTitle}>Current delivery</Text><Text style={styles.sectionCount}>{activeOrders.length}</Text></View>
-          {currentOrder ? <DeliveryCard assignment={currentOrder} busy={actionBusy === currentOrder._id} onAction={performAction} onViewDetails={viewOrderDetails} showDialog={showDialog} /> : <View style={styles.emptyCard}><Text style={styles.emptyIcon}>✓</Text><Text style={styles.emptyTitle}>No active delivery</Text><Text style={styles.emptyText}>{bootstrap?.shift ? 'Stay available. A new order will appear here when the cashier assigns it.' : 'Start duty to become available for assignments.'}</Text></View>}
+          <View style={styles.sectionHeader}><Text style={styles.sectionTitle}>Current delivery run</Text><Text style={styles.sectionCount}>{currentRunOrders.length}</Text></View>
+          {currentDeliveryRuns.map(run => <View key={run.id}><DeliveryRunHeader run={run} busy={actionBusy === run.orders[0]?._id} onReturn={returnDeliveryRun} />{run.orders.map(order => <DeliveryCard key={order._id} assignment={order} busy={actionBusy === order._id} onAction={performAction} onViewDetails={viewOrderDetails} showDialog={showDialog} />)}</View>)}
+          {currentRunOrders.length === 0 && <View style={styles.emptyCard}><Text style={styles.emptyIcon}>✓</Text><Text style={styles.emptyTitle}>No order in the current run</Text><Text style={styles.emptyText}>{bootstrap?.shift ? 'Stay available. A new order will appear here when the cashier assigns it.' : 'Start duty to become available for assignments.'}</Text></View>}
+          {waitingAtRestaurant.length > 0 && <><View style={styles.sectionHeader}><Text style={styles.sectionTitle}>Next restaurant pickup</Text><Text style={styles.sectionCount}>{waitingAtRestaurant.length}</Text></View><View style={styles.pickupNotice}><Text style={styles.pickupNoticeTitle}>{waitingAtRestaurant.length} order{waitingAtRestaurant.length === 1 ? '' : 's'} waiting</Text><Text style={styles.pickupNoticeText}>These orders were assigned while you were away. They will join one pickup run when you return inside the restaurant geofence.</Text></View>{waitingAtRestaurant.map(order => <DeliveryCard key={order._id} assignment={order} busy={actionBusy === order._id} onAction={performAction} onViewDetails={viewOrderDetails} showDialog={showDialog} />)}</>}
         </>}
         {tab === 'deliveries' && <>
           <View style={styles.sectionHeader}><View><Text style={styles.pageTitle}>My Deliveries</Text><Text style={styles.pageSubtitle}>{businessDate ? `All orders assigned to you for business day ${businessDate}.` : 'All orders assigned to you for the current business day.'}</Text></View></View>
-          {activeOrders.map(order => <DeliveryCard key={order._id} assignment={order} busy={actionBusy === order._id} onAction={performAction} onViewDetails={viewOrderDetails} showDialog={showDialog} />)}
+          {currentDeliveryRuns.map(run => <View key={run.id}><DeliveryRunHeader run={run} busy={actionBusy === run.orders[0]?._id} onReturn={returnDeliveryRun} />{run.orders.map(order => <DeliveryCard key={order._id} assignment={order} busy={actionBusy === order._id} onAction={performAction} onViewDetails={viewOrderDetails} showDialog={showDialog} />)}</View>)}
+          {waitingAtRestaurant.map(order => <DeliveryCard key={order._id} assignment={order} busy={actionBusy === order._id} onAction={performAction} onViewDetails={viewOrderDetails} showDialog={showDialog} />)}
           {historyOrders.length > 0 && <><Text style={styles.historyTitle}>BUSINESS DAY HISTORY</Text>{historyOrders.map(order => <DeliveryCard key={order._id} assignment={order} busy={false} onAction={performAction} onViewDetails={viewOrderDetails} showDialog={showDialog} />)}</>}
           {orders.length === 0 && <View style={styles.emptyCard}><Text style={styles.emptyIcon}>□</Text><Text style={styles.emptyTitle}>No deliveries yet</Text><Text style={styles.emptyText}>Orders assigned during this business day will appear here.</Text></View>}
         </>}
@@ -484,6 +705,8 @@ const RiderApp = () => {
             <View style={styles.profileRow}><Text style={styles.profileLabel}>Queued GPS points</Text><Text style={styles.profileValue}>{trackingHealth.queueDepth}</Text></View>
             <View style={styles.profileRow}><Text style={styles.profileLabel}>Battery optimization</Text><Text style={[styles.profileValue, !batteryRestricted && styles.goodText]}>{batteryRestricted ? 'Restricted' : 'Unrestricted'}</Text></View>
             <View style={styles.profileRow}><Text style={styles.profileLabel}>Battery Saver</Text><Text style={[styles.profileValue, !lowPowerRestricted && styles.goodText]}>{lowPowerRestricted ? 'On' : 'Off'}</Text></View>
+            <View style={styles.profileRow}><Text style={styles.profileLabel}>Push notifications</Text><Text style={[styles.profileValue, Boolean(pushRegistration?.pushToken) && styles.goodText]}>{pushRegistration?.pushToken ? 'Connected' : pushRegistration?.granted === false ? 'Permission disabled' : 'Registering…'}</Text></View>
+            {pushRegistration?.error ? <View style={styles.profileRow}><Text style={styles.profileLabel}>Push status</Text><Text style={[styles.profileValue, styles.serverValue]} numberOfLines={2}>{pushRegistration.error}</Text></View> : null}
             <View style={styles.profileRow}><Text style={styles.profileLabel}>App version</Text><Text style={styles.profileValue}>{APP_VERSION}</Text></View>
             <View style={styles.profileRow}><Text style={styles.profileLabel}>Server</Text><Text numberOfLines={1} style={[styles.profileValue, styles.serverValue]}>{API_BASE_URL}</Text></View>
           </View>
@@ -510,9 +733,10 @@ const styles = StyleSheet.create({
   badge: {backgroundColor: '#f1f5f9', borderRadius: 99, paddingHorizontal: 10, paddingVertical: 5}, badgeGood: {backgroundColor: '#dcfce7'}, badgeWarn: {backgroundColor: '#fef3c7'}, badgeInfo: {backgroundColor: '#e0e7ff'}, badgeText: {fontSize: 10, fontWeight: '900', color: '#64748b', textTransform: 'uppercase'}, badgeTextGood: {color: '#15803d'}, badgeTextWarn: {color: '#b45309'}, badgeTextInfo: {color: '#4338ca'},
   dialogOverlay: {flex: 1, backgroundColor: 'rgba(15,23,42,0.58)', alignItems: 'center', justifyContent: 'center', padding: 22}, dialogCard: {width: '100%', maxWidth: 420, borderRadius: 24, backgroundColor: '#fff', padding: 22, shadowColor: '#0f172a', shadowOpacity: 0.25, shadowRadius: 24, shadowOffset: {width: 0, height: 12}, elevation: 16}, dialogIcon: {width: 48, height: 48, borderRadius: 16, backgroundColor: '#eef2ff', alignItems: 'center', justifyContent: 'center'}, dialogIconDanger: {backgroundColor: '#fef2f2'}, dialogTitle: {fontSize: 21, fontWeight: '900', color: '#0f172a', marginTop: 16}, dialogMessage: {fontSize: 14, lineHeight: 21, color: '#64748b', marginTop: 7}, dialogActions: {flexDirection: 'row', justifyContent: 'flex-end', gap: 9, marginTop: 22}, dialogSecondaryButton: {minHeight: 45, borderRadius: 13, borderWidth: 1, borderColor: '#cbd5e1', backgroundColor: '#fff', paddingHorizontal: 17, alignItems: 'center', justifyContent: 'center'}, dialogSecondaryText: {fontSize: 13, fontWeight: '900', color: '#475569'}, dialogPrimaryButton: {minHeight: 45, borderRadius: 13, backgroundColor: '#4f46e5', paddingHorizontal: 18, alignItems: 'center', justifyContent: 'center'}, dialogPrimaryDanger: {backgroundColor: '#dc2626'}, dialogPrimaryText: {fontSize: 13, fontWeight: '900', color: '#fff'},
   dutyCard: {backgroundColor: '#0f172a', borderRadius: 24, padding: 20, marginBottom: 22, shadowColor: '#0f172a', shadowOpacity: 0.18, shadowRadius: 18, shadowOffset: {width: 0, height: 8}, elevation: 5}, dutyCardActive: {backgroundColor: '#064e3b'}, rowBetween: {flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12}, flexOne: {flex: 1}, eyebrow: {fontSize: 10, fontWeight: '900', color: '#818cf8', letterSpacing: 1.5}, eyebrowActive: {color: '#6ee7b7'}, dutyTitle: {fontSize: 23, fontWeight: '900', color: '#fff', marginTop: 4}, dutyTitleActive: {color: '#ecfdf5'}, trackingDot: {width: 13, height: 13, borderRadius: 99, backgroundColor: '#475569', marginTop: 4}, trackingDotActive: {backgroundColor: '#34d399', borderWidth: 3, borderColor: '#065f46'}, dutyHelp: {fontSize: 13, color: '#cbd5e1', lineHeight: 19, marginTop: 14}, dutyButton: {height: 49, borderRadius: 14, backgroundColor: '#4f46e5', alignItems: 'center', justifyContent: 'center', marginTop: 18}, endDutyButton: {backgroundColor: '#fff'}, dutyButtonText: {color: '#fff', fontWeight: '900', fontSize: 14}, endDutyText: {color: '#dc2626'}, shiftStats: {flexDirection: 'row', justifyContent: 'space-between', marginTop: 20, backgroundColor: 'rgba(255,255,255,0.08)', borderRadius: 16, padding: 14}, shiftValue: {color: '#fff', fontSize: 16, fontWeight: '900'}, shiftLabel: {color: '#a7f3d0', fontSize: 10, marginTop: 2},
-  sectionHeader: {flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12}, sectionTitle: {fontSize: 19, fontWeight: '900', color: '#0f172a'}, sectionCount: {backgroundColor: '#e0e7ff', color: '#4338ca', minWidth: 26, textAlign: 'center', borderRadius: 99, paddingVertical: 4, fontSize: 12, fontWeight: '900'}, pageTitle: {fontSize: 26, fontWeight: '900', color: '#0f172a'}, pageSubtitle: {fontSize: 13, color: '#64748b', lineHeight: 19, marginTop: 4, marginBottom: 16},
-  deliveryCard: {backgroundColor: '#fff', borderRadius: 22, borderWidth: 1, borderColor: '#e2e8f0', padding: 18, marginBottom: 14, shadowColor: '#0f172a', shadowOpacity: 0.05, shadowRadius: 12, shadowOffset: {width: 0, height: 5}, elevation: 2}, orderNumber: {fontSize: 22, fontWeight: '900', color: '#0f172a', marginTop: 2}, divider: {height: 1, backgroundColor: '#f1f5f9', marginVertical: 14}, customerName: {fontSize: 16, fontWeight: '800', color: '#1e293b'}, customerPhoneRow: {flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 7}, customerPhone: {color: '#475569', fontSize: 13, fontWeight: '700'}, contactActions: {flexDirection: 'row', gap: 9, marginTop: 10}, callButton: {flex: 1, height: 40, borderRadius: 11, backgroundColor: '#eef2ff', alignItems: 'center', justifyContent: 'center'}, callButtonText: {color: '#4338ca', fontWeight: '900', fontSize: 13}, whatsappButton: {flex: 1, height: 40, borderRadius: 11, backgroundColor: '#dcfce7', alignItems: 'center', justifyContent: 'center'}, whatsappButtonText: {color: '#15803d', fontWeight: '900', fontSize: 13}, address: {fontSize: 13, color: '#475569', lineHeight: 19, marginTop: 9}, orderItemsBox: {backgroundColor: '#f8fafc', borderRadius: 13, paddingHorizontal: 12, paddingVertical: 10, marginTop: 13, borderWidth: 1, borderColor: '#e2e8f0'}, orderItemsHeader: {flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingBottom: 5}, orderItemsTitle: {fontSize: 9, color: '#64748b', fontWeight: '900', letterSpacing: 1}, orderItemsCount: {fontSize: 10, color: '#4338ca', fontWeight: '900', backgroundColor: '#e0e7ff', borderRadius: 99, minWidth: 21, paddingVertical: 2, textAlign: 'center'}, orderItemRow: {flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10, paddingVertical: 8}, orderItemDivider: {borderTopWidth: 1, borderTopColor: '#e2e8f0'}, orderItemMain: {flex: 1}, orderItemName: {fontSize: 13, color: '#1e293b', fontWeight: '800'}, orderItemVariation: {fontSize: 11, color: '#6366f1', fontWeight: '700', marginTop: 2}, orderItemNote: {fontSize: 11, color: '#92400e', marginTop: 3}, orderItemAmount: {fontSize: 12, color: '#475569', fontWeight: '700'}, orderMeta: {flexDirection: 'row', justifyContent: 'space-between', gap: 12, marginTop: 13}, metaText: {fontSize: 11, color: '#64748b', fontWeight: '600', flexShrink: 1}, noteBox: {backgroundColor: '#fffbeb', borderRadius: 12, padding: 11, marginTop: 12}, noteLabel: {fontSize: 9, color: '#b45309', fontWeight: '900', letterSpacing: 1}, noteText: {fontSize: 12, lineHeight: 18, color: '#78350f', marginTop: 3}, detailsButton: {height: 43, borderRadius: 12, backgroundColor: '#4f46e5', alignItems: 'center', justifyContent: 'center', marginTop: 14}, detailsButtonText: {color: '#fff', fontWeight: '900', fontSize: 13}, mapButton: {height: 43, borderRadius: 12, backgroundColor: '#eef2ff', alignItems: 'center', justifyContent: 'center', marginTop: 10}, mapButtonText: {color: '#4338ca', fontWeight: '800', fontSize: 13}, actions: {flexDirection: 'row', gap: 9, marginTop: 10}, actionButton: {flex: 1, minHeight: 48, borderRadius: 13, backgroundColor: '#4f46e5', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 8}, actionDanger: {backgroundColor: '#dc2626'}, actionSuccess: {backgroundColor: '#059669'}, actionText: {color: '#fff', fontWeight: '900', textAlign: 'center', fontSize: 13}, buttonDisabled: {opacity: 0.56},
-  detailsPage: {flex: 1, backgroundColor: '#f8fafc', paddingHorizontal: 16}, detailsTopBar: {flexDirection: 'row', alignItems: 'center', gap: 12, paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: '#e2e8f0'}, detailsOrderNumber: {fontSize: 25, fontWeight: '900', color: '#0f172a', marginTop: 2}, detailsCloseIcon: {width: 38, height: 38, borderRadius: 12, backgroundColor: '#e2e8f0', alignItems: 'center', justifyContent: 'center'}, detailsCloseIconText: {fontSize: 27, lineHeight: 29, color: '#475569', fontWeight: '500'}, detailsLoading: {flexDirection: 'row', alignItems: 'center', gap: 9, backgroundColor: '#eef2ff', borderRadius: 12, padding: 10, marginTop: 12}, detailsLoadingText: {fontSize: 12, color: '#4338ca', fontWeight: '700'}, detailsScroll: {flex: 1}, detailsContent: {paddingVertical: 14, gap: 12}, detailsSection: {backgroundColor: '#fff', borderRadius: 16, borderWidth: 1, borderColor: '#e2e8f0', padding: 14}, detailsSectionTitle: {fontSize: 9, color: '#64748b', fontWeight: '900', letterSpacing: 1.1, marginBottom: 8}, detailsCustomer: {fontSize: 17, color: '#1e293b', fontWeight: '900'}, detailsMissing: {fontSize: 12, color: '#94a3b8', fontStyle: 'italic', lineHeight: 18}, detailsAddress: {fontSize: 14, color: '#334155', lineHeight: 21, fontWeight: '600'}, detailsItemRow: {flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10, paddingVertical: 10}, detailsTotal: {backgroundColor: '#0f172a', borderRadius: 16, padding: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between'}, detailsTotalLabel: {fontSize: 13, color: '#cbd5e1', fontWeight: '700'}, detailsTotalValue: {fontSize: 20, color: '#fff', fontWeight: '900'}, detailsCloseButton: {height: 49, borderRadius: 14, backgroundColor: '#0f172a', alignItems: 'center', justifyContent: 'center', marginTop: 10}, detailsCloseButtonText: {color: '#fff', fontSize: 14, fontWeight: '900'},
+  sectionHeader: {flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12}, sectionTitle: {fontSize: 19, fontWeight: '900', color: '#0f172a'}, sectionCount: {backgroundColor: '#e0e7ff', color: '#4338ca', minWidth: 26, textAlign: 'center', borderRadius: 99, paddingVertical: 4, fontSize: 12, fontWeight: '900'}, pageTitle: {fontSize: 26, fontWeight: '900', color: '#0f172a'}, pageSubtitle: {fontSize: 13, color: '#64748b', lineHeight: 19, marginTop: 4, marginBottom: 16}, pickupNotice: {backgroundColor: '#fff7ed', borderWidth: 1, borderColor: '#fed7aa', borderRadius: 16, padding: 14, marginBottom: 12}, pickupNoticeTitle: {fontSize: 14, fontWeight: '900', color: '#9a3412'}, pickupNoticeText: {fontSize: 12, lineHeight: 18, color: '#c2410c', marginTop: 3},
+  runCard: {backgroundColor: '#eef2ff', borderRadius: 20, borderWidth: 1, borderColor: '#c7d2fe', padding: 16, marginBottom: 12}, runEyebrow: {fontSize: 9, fontWeight: '900', color: '#6366f1', letterSpacing: 1.2}, runTitle: {fontSize: 17, fontWeight: '900', color: '#312e81', marginTop: 3}, runPath: {flexDirection: 'row', alignItems: 'center', marginTop: 15}, runNode: {width: 25, height: 25, borderRadius: 99, alignItems: 'center', justifyContent: 'center', backgroundColor: '#818cf8'}, runNodeDone: {backgroundColor: '#059669'}, runNodeText: {fontSize: 10, color: '#fff', fontWeight: '900'}, runLine: {height: 4, flex: 1, minWidth: 12, backgroundColor: '#c7d2fe'}, runLineDone: {backgroundColor: '#34d399'}, runHelp: {fontSize: 11, lineHeight: 17, color: '#4338ca', fontWeight: '700', marginTop: 9}, runPendingText: {fontSize: 11, lineHeight: 17, color: '#6366f1', marginTop: 10}, runReturnButton: {height: 47, borderRadius: 13, alignItems: 'center', justifyContent: 'center', backgroundColor: '#059669', marginTop: 13}, runReturnText: {fontSize: 13, color: '#fff', fontWeight: '900'},
+  deliveryCard: {backgroundColor: '#fff', borderRadius: 22, borderWidth: 1, borderColor: '#e2e8f0', padding: 18, marginBottom: 14, shadowColor: '#0f172a', shadowOpacity: 0.05, shadowRadius: 12, shadowOffset: {width: 0, height: 5}, elevation: 2}, orderNumber: {fontSize: 22, fontWeight: '900', color: '#0f172a', marginTop: 2}, runState: {fontSize: 11, color: '#6366f1', fontWeight: '800', marginTop: 3}, runReturnedText: {fontSize: 10, color: '#059669', fontWeight: '800', marginTop: 7}, divider: {height: 1, backgroundColor: '#f1f5f9', marginVertical: 14}, customerName: {fontSize: 16, fontWeight: '800', color: '#1e293b'}, customerPhoneRow: {flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 7}, customerPhone: {color: '#475569', fontSize: 13, fontWeight: '700'}, contactActions: {flexDirection: 'row', gap: 9, marginTop: 10}, callButton: {flex: 1, height: 40, borderRadius: 11, backgroundColor: '#eef2ff', alignItems: 'center', justifyContent: 'center'}, callButtonText: {color: '#4338ca', fontWeight: '900', fontSize: 13}, whatsappButton: {flex: 1, height: 40, borderRadius: 11, backgroundColor: '#dcfce7', alignItems: 'center', justifyContent: 'center'}, whatsappButtonText: {color: '#15803d', fontWeight: '900', fontSize: 13}, address: {fontSize: 13, color: '#475569', lineHeight: 19, marginTop: 9}, orderItemsBox: {backgroundColor: '#f8fafc', borderRadius: 13, paddingHorizontal: 12, paddingVertical: 10, marginTop: 13, borderWidth: 1, borderColor: '#e2e8f0'}, orderItemsHeader: {flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingBottom: 5}, orderItemsTitle: {fontSize: 9, color: '#64748b', fontWeight: '900', letterSpacing: 1}, orderItemsCount: {fontSize: 10, color: '#4338ca', fontWeight: '900', backgroundColor: '#e0e7ff', borderRadius: 99, minWidth: 21, paddingVertical: 2, textAlign: 'center'}, orderItemRow: {flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10, paddingVertical: 8}, orderItemDivider: {borderTopWidth: 1, borderTopColor: '#e2e8f0'}, orderItemMain: {flex: 1}, orderItemName: {fontSize: 13, color: '#1e293b', fontWeight: '800'}, orderItemVariation: {fontSize: 11, color: '#6366f1', fontWeight: '700', marginTop: 2}, orderItemNote: {fontSize: 11, color: '#92400e', marginTop: 3}, orderItemAmount: {fontSize: 12, color: '#475569', fontWeight: '700'}, collectionBox: {backgroundColor: '#ecfdf5', borderRadius: 13, borderWidth: 1, borderColor: '#a7f3d0', paddingHorizontal: 12, marginTop: 13}, collectionRow: {flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12, paddingVertical: 10}, collectionLabel: {fontSize: 11, color: '#047857', fontWeight: '700'}, collectionValue: {fontSize: 12, color: '#065f46', fontWeight: '900'}, collectionTotalRow: {borderTopWidth: 1, borderTopColor: '#a7f3d0'}, collectionTotalLabel: {fontSize: 13, color: '#064e3b', fontWeight: '900'}, collectionTotalValue: {fontSize: 17, color: '#064e3b', fontWeight: '900'}, orderMeta: {flexDirection: 'row', justifyContent: 'space-between', gap: 12, marginTop: 10}, metaText: {fontSize: 11, color: '#64748b', fontWeight: '600', flexShrink: 1}, noteBox: {backgroundColor: '#fffbeb', borderRadius: 12, padding: 11, marginTop: 12}, noteLabel: {fontSize: 9, color: '#b45309', fontWeight: '900', letterSpacing: 1}, noteText: {fontSize: 12, lineHeight: 18, color: '#78350f', marginTop: 3}, detailsButton: {height: 43, borderRadius: 12, backgroundColor: '#4f46e5', alignItems: 'center', justifyContent: 'center', marginTop: 14}, detailsButtonText: {color: '#fff', fontWeight: '900', fontSize: 13}, mapButton: {height: 43, borderRadius: 12, backgroundColor: '#eef2ff', alignItems: 'center', justifyContent: 'center', marginTop: 10}, mapButtonText: {color: '#4338ca', fontWeight: '800', fontSize: 13}, actions: {flexDirection: 'row', gap: 9, marginTop: 10}, actionButton: {flex: 1, minHeight: 48, borderRadius: 13, backgroundColor: '#4f46e5', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 8}, actionDanger: {backgroundColor: '#dc2626'}, actionSuccess: {backgroundColor: '#059669'}, actionText: {color: '#fff', fontWeight: '900', textAlign: 'center', fontSize: 13}, buttonDisabled: {opacity: 0.56},
+  detailsPage: {flex: 1, backgroundColor: '#f8fafc', paddingHorizontal: 16}, detailsTopBar: {flexDirection: 'row', alignItems: 'center', gap: 12, paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: '#e2e8f0'}, detailsOrderNumber: {fontSize: 25, fontWeight: '900', color: '#0f172a', marginTop: 2}, detailsCloseIcon: {width: 38, height: 38, borderRadius: 12, backgroundColor: '#e2e8f0', alignItems: 'center', justifyContent: 'center'}, detailsCloseIconText: {fontSize: 27, lineHeight: 29, color: '#475569', fontWeight: '500'}, detailsLoading: {flexDirection: 'row', alignItems: 'center', gap: 9, backgroundColor: '#eef2ff', borderRadius: 12, padding: 10, marginTop: 12}, detailsLoadingText: {fontSize: 12, color: '#4338ca', fontWeight: '700'}, detailsScroll: {flex: 1}, detailsContent: {paddingVertical: 14, gap: 12}, detailsSection: {backgroundColor: '#fff', borderRadius: 16, borderWidth: 1, borderColor: '#e2e8f0', padding: 14}, detailsSectionTitle: {fontSize: 9, color: '#64748b', fontWeight: '900', letterSpacing: 1.1, marginBottom: 8}, detailsCustomer: {fontSize: 17, color: '#1e293b', fontWeight: '900'}, detailsMissing: {fontSize: 12, color: '#94a3b8', fontStyle: 'italic', lineHeight: 18}, detailsAddress: {fontSize: 14, color: '#334155', lineHeight: 21, fontWeight: '600'}, detailsItemRow: {flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10, paddingVertical: 10}, detailsCollection: {backgroundColor: '#0f172a', borderRadius: 16, paddingHorizontal: 16}, detailsChargeLabel: {fontSize: 12, color: '#a7f3d0', fontWeight: '700'}, detailsChargeValue: {fontSize: 14, color: '#d1fae5', fontWeight: '900'}, detailsCollectionTotal: {borderTopWidth: 1, borderTopColor: '#334155', paddingVertical: 15}, detailsTotalLabel: {fontSize: 13, color: '#cbd5e1', fontWeight: '700', flex: 1}, detailsTotalValue: {fontSize: 20, color: '#fff', fontWeight: '900'}, detailsCloseButton: {height: 49, borderRadius: 14, backgroundColor: '#0f172a', alignItems: 'center', justifyContent: 'center', marginTop: 10}, detailsCloseButtonText: {color: '#fff', fontSize: 14, fontWeight: '900'},
   emptyCard: {backgroundColor: '#fff', borderRadius: 22, borderWidth: 1, borderColor: '#e2e8f0', borderStyle: 'dashed', alignItems: 'center', padding: 28}, emptyIcon: {fontSize: 28, color: '#94a3b8'}, emptyTitle: {fontSize: 16, fontWeight: '900', color: '#334155', marginTop: 8}, emptyText: {fontSize: 13, lineHeight: 19, textAlign: 'center', color: '#64748b', marginTop: 5}, offlineBanner: {backgroundColor: '#fef3c7', borderRadius: 15, padding: 13, marginBottom: 14, borderWidth: 1, borderColor: '#fde68a'}, offlineTitle: {fontSize: 13, fontWeight: '900', color: '#92400e'}, offlineText: {fontSize: 11, color: '#a16207', marginTop: 2}, trackingWarning: {backgroundColor: '#fff7ed', borderRadius: 16, padding: 14, marginBottom: 14, borderWidth: 1, borderColor: '#fed7aa'}, trackingWarningTitle: {fontSize: 14, fontWeight: '900', color: '#9a3412'}, trackingWarningText: {fontSize: 12, lineHeight: 18, color: '#c2410c', marginTop: 3}, trackingRepairButton: {alignSelf: 'flex-start', backgroundColor: '#ea580c', borderRadius: 10, paddingHorizontal: 13, paddingVertical: 9, marginTop: 10}, trackingRepairText: {fontSize: 12, fontWeight: '900', color: '#fff'}, historyTitle: {fontSize: 10, fontWeight: '900', color: '#94a3b8', letterSpacing: 1.5, marginVertical: 16},
   profileCard: {backgroundColor: '#fff', borderRadius: 22, borderWidth: 1, borderColor: '#e2e8f0', padding: 18, alignItems: 'center'}, avatar: {width: 64, height: 64, borderRadius: 22, backgroundColor: '#e0e7ff', alignItems: 'center', justifyContent: 'center'}, avatarText: {fontSize: 25, fontWeight: '900', color: '#4338ca'}, profileName: {fontSize: 20, fontWeight: '900', color: '#0f172a', marginTop: 12}, profileEmail: {fontSize: 13, color: '#64748b', marginTop: 3}, profileDivider: {height: 1, backgroundColor: '#f1f5f9', width: '100%', marginVertical: 18}, profileRow: {width: '100%', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 8, gap: 12}, profileLabel: {fontSize: 13, color: '#64748b'}, profileValue: {fontSize: 13, fontWeight: '800', color: '#334155', textAlign: 'right'}, serverValue: {maxWidth: '62%'}, goodText: {color: '#059669'}, repairButton: {height: 48, borderRadius: 14, backgroundColor: '#059669', alignItems: 'center', justifyContent: 'center', marginTop: 14}, repairButtonText: {color: '#fff', fontWeight: '900'}, settingsButton: {height: 48, borderRadius: 14, backgroundColor: '#eef2ff', alignItems: 'center', justifyContent: 'center', marginTop: 12}, settingsButtonText: {color: '#4338ca', fontWeight: '900'}, settingsHelp: {fontSize: 12, lineHeight: 18, color: '#64748b', marginTop: 10, paddingHorizontal: 5}, signOutButton: {height: 49, borderRadius: 14, borderWidth: 1, borderColor: '#fecaca', backgroundColor: '#fef2f2', alignItems: 'center', justifyContent: 'center', marginTop: 22}, signOutText: {color: '#dc2626', fontWeight: '900'},
   tabBar: {position: 'absolute', left: 0, right: 0, bottom: 0, flexDirection: 'row', backgroundColor: '#fff', borderTopWidth: 1, borderTopColor: '#e2e8f0', paddingTop: 8, shadowColor: '#0f172a', shadowOpacity: 0.08, shadowRadius: 12, shadowOffset: {width: 0, height: -4}, elevation: 12}, tabButton: {flex: 1, alignItems: 'center', paddingVertical: 5, position: 'relative'}, tabIcon: {fontSize: 17, color: '#94a3b8', fontWeight: '900'}, tabLabel: {fontSize: 10, color: '#94a3b8', fontWeight: '800', marginTop: 2}, tabActive: {color: '#4f46e5'}, tabIndicator: {position: 'absolute', top: -8, width: 28, height: 3, borderRadius: 99, backgroundColor: '#4f46e5'},

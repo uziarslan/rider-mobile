@@ -4,6 +4,7 @@ import * as TaskManager from 'expo-task-manager';
 import {API_BASE_URL} from '../src/config';
 import {loadSession} from '../src/storage';
 import {
+  ensureTrackingHealthy,
   flushLocationQueue,
   getTrackingHealth,
   isTracking,
@@ -144,6 +145,15 @@ test('preserves background tracking intent when Android briefly reports the serv
 
   await expect(isTracking()).resolves.toBe('stopped');
   await expect(AsyncStorage.getItem('@cenciss-rider/tracking-mode')).resolves.toBe('background');
+});
+
+test('does not restart tracking before foreground location permission is granted', async () => {
+  (TaskManager.isAvailableAsync as jest.Mock).mockResolvedValue(true);
+  (Location.getForegroundPermissionsAsync as jest.Mock).mockResolvedValue({granted: false});
+
+  await expect(ensureTrackingHealthy()).rejects.toThrow('Precise location permission is required');
+  expect(Location.startLocationUpdatesAsync).not.toHaveBeenCalled();
+  expect(Location.watchPositionAsync).not.toHaveBeenCalled();
 });
 
 test('uploads captured points and removes them from the offline queue', async () => {
