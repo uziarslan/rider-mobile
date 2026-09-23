@@ -60,9 +60,17 @@ npm run build:apk
 
 On the first build, Expo will ask you to sign in, create/link the EAS project, and create or select Android signing credentials. Preserve the same signing key for every future update. Set `EXPO_PUBLIC_API_BASE_URL` in the EAS environment to the production HTTPS API address before building.
 
+To build version 1.0.5 locally with the configured Expo signing key, Java 17, and the Android SDK installed:
+
+```sh
+EXPO_PUBLIC_API_BASE_URL=https://api.cenciss.com npm run build:apk -- --local --output ./artifacts/Cenciss-Delivery-1.0.5.apk --non-interactive --freeze-credentials
+```
+
+This writes the installable APK to `artifacts/Cenciss-Delivery-1.0.5.apk`. It requires an existing Expo login and signing credentials; it does not create or replace the signing key.
+
 After the build finishes, download the `.apk`, copy it to each rider phone, open it from the Files app, and allow **Install unknown apps** for that file source. Play Store publication is not required.
 
-The current source is version `1.0.4` (`versionCode` 8). No replacement APK is generated automatically; build it only when the testing round is approved.
+The current source is version `1.0.5` (`versionCode` 9). No replacement APK is generated automatically; build it only when the testing round is approved.
 
 ## Rider phone setup
 
